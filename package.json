@@ -1,0 +1,36 @@
+{
+  "name": "ai-interview-backend",
+  "version": "1.0.0",
+  "description": "Real-time AI Interview Engine service for PractiWiz (WebRTC + WebSocket + ElevenLabs STT/TTS + OpenAI)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@langchain/core": "^0.3.77",
+    "@langchain/openai": "^0.4.9",
+    "@roamhq/wrtc": "^0.8.0",
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "form-data": "^4.0.0",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.7.0",
+    "jsonwebtoken": "^9.0.2",
+    "mammoth": "^1.12.1",
+    "morgan": "^1.10.0",
+    "mssql": "^11.0.1",
+    "pdf-parse": "^1.1.4",
+    "socket.io": "^4.8.1",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

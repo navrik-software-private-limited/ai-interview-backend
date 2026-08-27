@@ -403,3 +403,29 @@ CREATE TABLE dbo.interview_reports (
     CONSTRAINT UQ_interview_reports_session_id UNIQUE (session_id)
 );
 GO
+
+-- ============================================================================
+-- doc/07_INTERVIEW_MODULE_STATUS_AND_ROADMAP.md gap #5: case-study-specific
+-- evaluation dimensions (doc 04 §7 — Understanding/Approach/Reasoning/
+-- Trade-offs/Technical-business-thinking/Communication), additive alongside
+-- the existing category_scores.case_analysis numeric score.
+-- ============================================================================
+
+IF COL_LENGTH('dbo.interview_evaluations', 'case_study') IS NULL
+  ALTER TABLE dbo.interview_evaluations ADD case_study NVARCHAR(MAX) NULL; -- JSON: {understanding, approach, reasoning, tradeoffs, technicalBusinessThinking, communication}
+GO
+
+-- ============================================================================
+-- doc/07_INTERVIEW_MODULE_STATUS_AND_ROADMAP.md gap #6: persist the
+-- questionRef-linked strengths/weaknesses that strengthsWeaknessesAnalyzer.js
+-- already computes (code-enforced citation requirement) but which were
+-- previously dropped before storage. Additive alongside the existing plain
+-- strengths/weaknesses JSON-array-of-strings columns, which are unchanged.
+-- ============================================================================
+
+IF COL_LENGTH('dbo.interview_evaluations', 'strengths_with_refs') IS NULL
+  ALTER TABLE dbo.interview_evaluations ADD strengths_with_refs NVARCHAR(MAX) NULL; -- JSON array of {text, questionRef}
+GO
+IF COL_LENGTH('dbo.interview_evaluations', 'weaknesses_with_refs') IS NULL
+  ALTER TABLE dbo.interview_evaluations ADD weaknesses_with_refs NVARCHAR(MAX) NULL; -- JSON array of {text, questionRef}
+GO

@@ -365,19 +365,29 @@ async function markCaseAcknowledged(sessionId) {
 // single session_id). LEFT JOIN interview_reports since a session may not
 // have completed report generation yet (or may have failed) — a Reports tab
 // row still needs to show up as "generating"/"failed", not disappear.
-async function fetchSessionsForCandidate(candidateId) {
+//
+// doc/07 gap #8: paginated (OFFSET/FETCH NEXT) rather than returning every
+// session in one call — this repository function has exactly one caller
+// (candidateSessionsController.js, itself only reached from the Reports
+// tab), so there's no other consumer whose behavior this could silently
+// change. `COUNT(*) OVER()` rides along in the same query so the caller gets
+// a total without a second round-trip.
+async function fetchSessionsForCandidate(candidateId, { page = 1, limit = 10 } = {}) {
   try {
     const pool = await getPool();
     const result = await pool
       .request()
       .input("candidateId", sql.Int, candidateId)
+      .input("offset", sql.Int, (page - 1) * limit)
+      .input("limit", sql.Int, limit)
       .query(`
         SELECT s.id AS sessionId, s.interview_id AS interviewId, s.status AS sessionStatus,
                s.started_at AS startedAt, s.ended_at AS endedAt,
                r.status AS reportStatus, r.report AS report, r.final_recommendation AS finalRecommendation,
                r.generated_at AS reportGeneratedAt,
                ctx.resume_reference AS resumeReference, ctx.jd_reference AS jdReference,
-               ctx.context_snapshot AS contextSnapshot
+               ctx.context_snapshot AS contextSnapshot,
+               COUNT(*) OVER() AS totalCount
         FROM dbo.interview_sessions s
         LEFT JOIN dbo.interview_reports r ON r.session_id = s.id
         OUTER APPLY (
@@ -388,8 +398,9 @@ async function fetchSessionsForCandidate(candidateId) {
         ) ctx
         WHERE s.candidate_id = @candidateId
         ORDER BY s.started_at DESC
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY
       `);
-    return result.recordset.map((row) => {
+    const sessions = result.recordset.map((row) => {
       const contextSnapshot = row.contextSnapshot ? JSON.parse(row.contextSnapshot) : {};
       const report = row.report ? JSON.parse(row.report) : null;
       return {
@@ -408,9 +419,10 @@ async function fetchSessionsForCandidate(candidateId) {
         jdReference: row.jdReference || null,
       };
     });
+    return { sessions, total: result.recordset[0]?.totalCount || 0 };
   } catch (err) {
     logger.warn("fetchSessionsForCandidate failed:", err.message);
-    return [];
+    return { sessions: [], total: 0 };
   }
 }
 

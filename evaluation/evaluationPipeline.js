@@ -5,6 +5,7 @@ const questionEvaluator = require("./questionEvaluator");
 const skillResultAggregator = require("./skillResultAggregator");
 const languageProfiler = require("./languageProfiler");
 const softSkillsEvaluator = require("./softSkillsEvaluator");
+const caseStudyEvaluator = require("./caseStudyEvaluator");
 const scoringAggregator = require("./scoringAggregator");
 const strengthsWeaknessesAnalyzer = require("./strengthsWeaknessesAnalyzer");
 const evidenceTracer = require("./evidenceTracer");
@@ -41,11 +42,13 @@ async function generateReport(sessionId) {
     // Step 4: pure-JS per-section skill rollup.
     const skillResults = skillResultAggregator.aggregateSkillResults(questionEvaluations, data.skillLabels);
 
-    // Steps 5-6 (L3-02): independent of each other and of the coding score,
-    // safe to run in parallel.
-    const [languageProfile, softSkills] = await Promise.all([
+    // Steps 5-6 (L3-02) + case-study dimensions (doc 04 §7, doc/07 gap #5):
+    // all three are independent of each other and of the coding score, safe
+    // to run in parallel.
+    const [languageProfile, softSkills, caseStudy] = await Promise.all([
       languageProfiler.profileLanguage(flatTranscript),
       softSkillsEvaluator.evaluateSoftSkills(flatTranscript, questionEvaluations),
+      caseStudyEvaluator.evaluateCaseStudy(questionEvaluations),
     ]);
 
     // Step 7 (L3-01 §2): category scores + overall score.
@@ -56,12 +59,16 @@ async function generateReport(sessionId) {
       codingSubmissions: data.codingSubmissions,
     });
 
-    // Step 8 (L3-01 §3/§4): evidence-grounded strengths/weaknesses.
-    const { strengths, weaknesses } = await strengthsWeaknessesAnalyzer.analyzeStrengthsWeaknesses({
-      questionEvaluations,
-      softSkills,
-      languageProfile,
-    });
+    // Step 8 (L3-01 §3/§4): evidence-grounded strengths/weaknesses. `*WithRefs`
+    // (doc/07 gap #6) carries the same bullets with their questionRef
+    // citation, threaded through below to persistence + the report so the
+    // linkage isn't dropped after this call returns.
+    const { strengths, weaknesses, strengthsWithRefs, weaknessesWithRefs } =
+      await strengthsWeaknessesAnalyzer.analyzeStrengthsWeaknesses({
+        questionEvaluations,
+        softSkills,
+        languageProfile,
+      });
 
     // Step 9 (L3-01 §5): pure-JS evidence trace.
     const evidenceTrace = evidenceTracer.traceEvidence(questionEvaluations);
@@ -73,8 +80,11 @@ async function generateReport(sessionId) {
       evidenceTrace,
       strengths,
       weaknesses,
+      strengthsWithRefs,
+      weaknessesWithRefs,
       languageProfile,
       softSkills,
+      caseStudy,
     });
 
     // Step 10 (L3-04 §2): writes better_answer back onto each question
@@ -99,11 +109,14 @@ async function generateReport(sessionId) {
       skillResults,
       softSkills,
       languageProfile,
+      caseStudy,
       codingSubmissions: data.codingSubmissions,
       categoryScores,
       overallScore,
       strengths,
       weaknesses,
+      strengthsWithRefs,
+      weaknessesWithRefs,
       evidenceTrace,
       flatTranscript,
       proctoringSummary,

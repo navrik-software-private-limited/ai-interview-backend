@@ -54,7 +54,10 @@ function buildCaseContextFragment(caseContentText) {
 
 // extraContext's shape depends on section: the resumeContext object (JD_RESUME)
 // or the caseContentText string (CASE). Ignored for every other section.
-async function generateQuestion(section, history, extraContext = null) {
+// doc/real_time_interview_communication_improvement.md Phase 6: extracted so
+// both the batch (generateQuestion) and streaming (generateQuestionStream)
+// variants below build the exact same prompt.
+function buildQuestionSystemPrompt(section, extraContext) {
   const framing = SECTION_FRAMING[section];
   if (!framing) {
     throw new Error(`generateQuestion called for a section with no framing: ${section}`);
@@ -65,31 +68,59 @@ async function generateQuestion(section, history, extraContext = null) {
   } else if (section === "CASE" && extraContext) {
     systemPrompt += buildCaseContextFragment(extraContext);
   }
-  const question = await llmClient.generateReply(history, systemPrompt);
+  return systemPrompt;
+}
+
+async function generateQuestion(section, history, extraContext = null, { signal } = {}) {
+  const systemPrompt = buildQuestionSystemPrompt(section, extraContext);
+  const question = await llmClient.generateReply(history, systemPrompt, { signal });
   return question.trim();
+}
+
+async function generateQuestionStream(section, history, extraContext = null, { signal } = {}) {
+  const systemPrompt = buildQuestionSystemPrompt(section, extraContext);
+  return llmClient.generateReplyStream(history, systemPrompt, { signal });
 }
 
 // doc 04 §7's case.presented step: a short, natural spoken narration of the
 // real case (not the raw labeled text blob) before questioning begins. Only
 // called when caseContentText is available — the CASE section transition
 // skips straight to questions otherwise (existing generic behavior).
-async function generateCasePresentation(caseContentText) {
-  const systemPrompt = [
+function buildCasePresentationSystemPrompt(caseContentText) {
+  return [
     "You are an AI interviewer presenting a business case study to a candidate before questioning them on it.",
     "Narrate the following case content naturally in 3-5 spoken sentences, as if introducing it out loud — no headers, no markdown, no bullet points.",
     "Do not ask a question yet, just set up the scenario.",
     `Case content: """${caseContentText}"""`,
   ].join(" ");
-  const presentation = await llmClient.generateReply([], systemPrompt);
+}
+
+async function generateCasePresentation(caseContentText, { signal } = {}) {
+  const systemPrompt = buildCasePresentationSystemPrompt(caseContentText);
+  const presentation = await llmClient.generateReply([], systemPrompt, { signal });
   return presentation.trim();
+}
+
+async function generateCasePresentationStream(caseContentText, { signal } = {}) {
+  const systemPrompt = buildCasePresentationSystemPrompt(caseContentText);
+  return llmClient.generateReplyStream([], systemPrompt, { signal });
 }
 
 // doc 04 §2 follow-ups: probes a specific gap in the candidate's last answer
 // rather than repeating/rephrasing the original question.
-async function generateFollowUp(history, reason) {
-  const systemPrompt = `${BASE_INSTRUCTION} Ask ONE natural follow-up question that specifically probes: ${reason}. Do not repeat the original question.`;
-  const question = await llmClient.generateReply(history, systemPrompt);
+function buildFollowUpSystemPrompt(reason) {
+  return `${BASE_INSTRUCTION} Ask ONE natural follow-up question that specifically probes: ${reason}. Do not repeat the original question.`;
+}
+
+async function generateFollowUp(history, reason, { signal } = {}) {
+  const systemPrompt = buildFollowUpSystemPrompt(reason);
+  const question = await llmClient.generateReply(history, systemPrompt, { signal });
   return question.trim();
+}
+
+async function generateFollowUpStream(history, reason, { signal } = {}) {
+  const systemPrompt = buildFollowUpSystemPrompt(reason);
+  return llmClient.generateReplyStream(history, systemPrompt, { signal });
 }
 
 // "Interview Room – Complete Interview Flow & Implementation Requirements.md"
@@ -166,7 +197,7 @@ function isUsableMcq(result) {
   );
 }
 
-async function generateMcqQuestion(section, history, extraContext = null) {
+async function generateMcqQuestion(section, history, extraContext = null, { signal } = {}) {
   const framing = MCQ_FRAMING[section] || MCQ_FRAMING.APTITUDE;
   let prompt = `You are an AI interviewer creating ONE multiple-choice question for a mock interview. ${framing}`;
   if (section === "JD_RESUME" && extraContext) prompt += buildResumeContextFragment(extraContext);
@@ -181,11 +212,19 @@ Respond with strict JSON only, no other text:
 }
 Exactly 4 options, exactly one correct answer, all four plausible (no option that's obviously a joke or trivially wrong), no numbering/markdown inside questionText.`;
 
-  const result = await llmClient.generateJson(prompt);
+  const result = await llmClient.generateJson(prompt, { signal });
   if (!isUsableMcq(result)) {
     return FALLBACK_MCQ[section] || FALLBACK_MCQ.APTITUDE;
   }
   return { questionText: result.questionText.trim(), options: result.options, correctOption: result.correctOption };
 }
 
-module.exports = { generateQuestion, generateFollowUp, generateCasePresentation, generateMcqQuestion };
+module.exports = {
+  generateQuestion,
+  generateQuestionStream,
+  generateFollowUp,
+  generateFollowUpStream,
+  generateCasePresentation,
+  generateCasePresentationStream,
+  generateMcqQuestion,
+};

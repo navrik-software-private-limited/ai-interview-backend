@@ -29,4 +29,26 @@ async function upsertCandidateReference({ candidateId, name, email }) {
   }
 }
 
-module.exports = { upsertCandidateReference };
+// doc/07_INTERVIEW_MODULE_STATUS_AND_ROADMAP.md gap #9: read counterpart to
+// upsertCandidateReference above — this table was write-only before (the
+// only reader was evaluation/sessionDataLoader.js's own separate query, used
+// post-interview for report generation). A single indexed point lookup, so
+// interviewer/interviewController.js awaits it directly at greeting time
+// rather than needing the fire-and-forget/cache-on-session treatment
+// jd-resume context gets (that one's LLM-bound and slow; this isn't).
+async function fetchCandidateName(candidateId) {
+  if (!candidateId) return null;
+  try {
+    const pool = await getPool();
+    const result = await pool
+      .request()
+      .input("candidateId", sql.Int, candidateId)
+      .query(`SELECT name FROM dbo.interview_candidates WHERE id = @candidateId`);
+    return result.recordset[0]?.name || null;
+  } catch (err) {
+    logger.warn("fetchCandidateName failed:", err.message);
+    return null;
+  }
+}
+
+module.exports = { upsertCandidateReference, fetchCandidateName };

@@ -1,12 +1,15 @@
 const { emitEnvelope } = require("../communication/envelope");
 const sessionStore = require("../session/sessionStore");
 const sessionRepository = require("../session/sessionRepository");
-const sttClient = require("../speech/sttClient");
+const candidateRepository = require("../session/candidateRepository");
+const turnMetrics = require("./turnMetrics");
+const sentenceChunker = require("./sentenceChunker");
+const sttStreamClient = require("../speech/sttStreamClient");
 const ttsClient = require("../speech/ttsClient");
 const ttsCache = require("../speech/ttsCache");
 const visemeEstimator = require("../speech/visemeEstimator");
 const audioOutbound = require("../webrtc/audioOutbound");
-const turnGate = require("../webrtc/turnGate");
+const conversationGate = require("../webrtc/conversationGate");
 const { buildGreeting } = require("../question-engine/greeting");
 const questionGenerator = require("../question-engine/questionGenerator");
 const followUpDecider = require("../question-engine/followUpDecider");
@@ -18,6 +21,7 @@ const codingSubmissionRepository = require("../coding/codingSubmissionRepository
 const adminConfigRepository = require("../admin/adminConfigRepository");
 const evaluationPipeline = require("../evaluation/evaluationPipeline");
 const logger = require("../logs/logger");
+const env = require("../config/env");
 
 // Sections driven by the utterance -> answer -> follow-up flow below. INTRO
 // is the greeting (handled separately), CODING is driven by its own
@@ -74,18 +78,31 @@ async function loadSectionConfig(sessionId) {
 }
 
 async function startInterview(io, sessionId) {
-  // Half-duplex gate (webrtc/turnGate.js): held for the entire greeting +
+  // Half-duplex gate (webrtc/conversationGate.js): held for the entire greeting +
   // first-question chain so the candidate's mic (echo of the AI's own
   // voice, or just ambient noise) can't be misread as speech mid-greeting.
-  turnGate.setAiBusy(sessionId);
+  const { turnId } = conversationGate.setAiBusy(sessionId);
   try {
     const { sectionOrder } = await loadSectionConfig(sessionId);
     await emitEnvelope(io, sessionId, "interview.started", {});
-    await speak(io, sessionId, buildGreeting(), { cacheable: true });
+    // doc/07 gap #9: personalized when a candidate name and/or resume/JD
+    // context is available, falls back to the original static greeting
+    // otherwise — see question-engine/greeting.js for the tiering.
+    const session = await sessionStore.getSession(sessionId);
+    const candidateName = await candidateRepository.fetchCandidateName(session && session.candidateId);
+    const resumeContext = (session && session.resumeContext) || null;
+    const greeting = await buildGreeting({ candidateName, resumeContext, signal: conversationGate.getSignal(sessionId) });
+    await speak(io, sessionId, greeting.text, { cacheable: greeting.cacheable });
     const firstSection = sectionOrder ? sectionOrder[1] : "JD_RESUME"; // index 0 is INTRO
     await transitionToSection(io, sessionId, firstSection || "JD_RESUME");
+  } catch (err) {
+    if (!conversationGate.isCurrentTurn(sessionId, turnId)) {
+      logger.info(`startInterview superseded by a newer turn sessionId=${sessionId}`);
+    } else {
+      throw err;
+    }
   } finally {
-    turnGate.releaseAiBusy(sessionId);
+    conversationGate.releaseAiBusy(sessionId, turnId);
   }
 }
 
@@ -93,10 +110,19 @@ async function onCandidateUtterance(io, sessionId, pcmBuffer, sampleRate) {
   // Held for the whole STT -> decide -> speak chain below, not just the
   // speak() call — this is also what stops a second utterance detected
   // mid-processing from triggering an overlapping reply.
-  turnGate.setAiBusy(sessionId);
+  const { turnId } = conversationGate.setAiBusy(sessionId);
   try {
-    await emitEnvelope(io, sessionId, "ai.listening", {});
-    const text = await timed(sessionId, "stt", () => sttClient.transcribeUtterance(pcmBuffer, sampleRate));
+    // doc/real_time_interview_communication_improvement.md Phase 8: this
+    // used to say "ai.listening" here — but the candidate has just *finished*
+    // speaking and the backend is now busy transcribing/deciding, the exact
+    // opposite of "listening." ai.thinking is the honest label for this
+    // moment; the real "genuinely ready for your voice" moment is emitted
+    // from askNextQuestion/askFollowUp below, once a question is actually
+    // waiting on a spoken answer.
+    await emitEnvelope(io, sessionId, "ai.thinking", {});
+    turnMetrics.mark(sessionId, "sttStart");
+    const text = await timed(sessionId, "stt", () => sttStreamClient.finishTranscription(sessionId, pcmBuffer, sampleRate));
+    turnMetrics.mark(sessionId, "sttEnd");
     if (!text || !text.trim()) return;
 
     await emitEnvelope(io, sessionId, "transcript.final", { speaker: "candidate", text });
@@ -105,9 +131,24 @@ async function onCandidateUtterance(io, sessionId, pcmBuffer, sampleRate) {
 
     await handleAnswer(io, sessionId, text);
   } catch (err) {
-    logger.error(`onCandidateUtterance failed sessionId=${sessionId}:`, err.message);
+    // doc/real_time_interview_communication_improvement.md Phase 3: a
+    // barge-in on the AI's *next* reply (while this utterance's STT/decision
+    // chain is still in flight) surfaces here as an AbortError once the
+    // now-superseded turnId's releaseAiBusy below is a no-op anyway — not a
+    // real failure, just noisier to log as one.
+    if (!conversationGate.isCurrentTurn(sessionId, turnId)) {
+      logger.info(`onCandidateUtterance superseded by a newer turn sessionId=${sessionId}`);
+    } else {
+      logger.error(`onCandidateUtterance failed sessionId=${sessionId}:`, err.message);
+      // doc/real_time_interview_communication_improvement.md Phase 9: the
+      // candidate's answer was never successfully processed (STT and/or the
+      // decision/generation chain genuinely failed, every fallback tier
+      // exhausted) — say so and re-open listening rather than leaving the
+      // frontend stuck on ai.thinking with the answer silently dropped.
+      await speakRecovery(io, sessionId, { expectAnswer: true });
+    }
   } finally {
-    turnGate.releaseAiBusy(sessionId);
+    conversationGate.releaseAiBusy(sessionId, turnId);
   }
 }
 
@@ -144,9 +185,13 @@ async function handleAnswer(io, sessionId, answerText) {
     questionId: session.currentQuestionAskedId,
   });
 
+  turnMetrics.mark(sessionId, "followupDecisionStart");
   const decision = await timed(sessionId, "followup-decision", () =>
-    followUpDecider.shouldFollowUp(session.currentQuestionText, answerText)
+    followUpDecider.shouldFollowUp(session.currentQuestionText, answerText, {
+      signal: conversationGate.getSignal(sessionId),
+    })
   );
+  turnMetrics.mark(sessionId, "followupDecisionEnd");
   if (decision.followUp) {
     await askFollowUp(io, sessionId, session, decision.reason);
   } else {
@@ -162,7 +207,7 @@ async function handleSkip(io, sessionId) {
   const session = await sessionStore.getSession(sessionId);
   if (!session) return;
 
-  turnGate.setAiBusy(sessionId);
+  const { turnId } = conversationGate.setAiBusy(sessionId);
   try {
     if (session.currentSection === "CODING") {
       if (!session.currentCodingProblem) return;
@@ -186,8 +231,20 @@ async function handleSkip(io, sessionId) {
     });
     sessionRepository.markQuestionAskedCompleted(session.currentQuestionAskedId);
     await advanceOrAskNext(io, sessionId);
+  } catch (err) {
+    // doc/real_time_interview_communication_improvement.md Phase 9: same
+    // last-resort recovery as onCandidateUtterance — advanceOrAskNext's
+    // generation chain can genuinely fail after every fallback tier is
+    // exhausted, and this function previously had no catch at all, leaving
+    // the frontend stuck with no signal.
+    if (!conversationGate.isCurrentTurn(sessionId, turnId)) {
+      logger.info(`handleSkip superseded by a newer turn sessionId=${sessionId}`);
+    } else {
+      logger.error(`handleSkip failed sessionId=${sessionId}:`, err.message);
+      await speakRecovery(io, sessionId);
+    }
   } finally {
-    turnGate.releaseAiBusy(sessionId);
+    conversationGate.releaseAiBusy(sessionId, turnId);
   }
 }
 
@@ -207,7 +264,7 @@ async function handleSkipSection(io, sessionId) {
   const section = session.currentSection;
   if (!section || section === "COMPLETING") return;
 
-  turnGate.setAiBusy(sessionId);
+  const { turnId } = conversationGate.setAiBusy(sessionId);
   try {
     await emitEnvelope(io, sessionId, "section.skipped", {
       section,
@@ -223,16 +280,42 @@ async function handleSkipSection(io, sessionId) {
 
     const next = sectionPlan.nextSection(section, session.sectionOrder);
     await transitionToSection(io, sessionId, next);
+  } catch (err) {
+    // doc/real_time_interview_communication_improvement.md Phase 9: see
+    // handleSkip's identical comment above — transitionToSection's
+    // generation chain (new section's question/case presentation) can
+    // genuinely fail after every fallback tier is exhausted.
+    if (!conversationGate.isCurrentTurn(sessionId, turnId)) {
+      logger.info(`handleSkipSection superseded by a newer turn sessionId=${sessionId}`);
+    } else {
+      logger.error(`handleSkipSection failed sessionId=${sessionId}:`, err.message);
+      await speakRecovery(io, sessionId);
+    }
   } finally {
-    turnGate.releaseAiBusy(sessionId);
+    conversationGate.releaseAiBusy(sessionId, turnId);
   }
 }
 
+// Requested UX fix (2026-08-26): the candidate should see the follow-up
+// text on screen BEFORE the AI starts speaking it, not after. Phase 6's
+// speak-first-persist-after order (streaming LLM->TTS together) can't
+// guarantee that — the full text is only known once speaking is basically
+// done. Reverted to persist-then-speak (same shape askNextQuestion's MCQ
+// branch already uses): generate the full text first, persist + emit
+// followup.started (text visible immediately), THEN speak it. speak() still
+// uses TTS streaming internally for fast time-to-first-audio — only the
+// LLM-streaming-while-speaking overlap is dropped for this call site.
+// speakGenerated()/generateFollowUpStream() are left in place, untouched,
+// just no longer called here.
 async function askFollowUp(io, sessionId, session, reason) {
   const history = recentHistory(await sessionStore.getHistory(sessionId));
+  const signal = conversationGate.getSignal(sessionId);
+
+  turnMetrics.mark(sessionId, "generationStart");
   const followUpText = await timed(sessionId, "followup-generation", () =>
-    questionGenerator.generateFollowUp(history, reason)
+    questionGenerator.generateFollowUp(history, reason, { signal })
   );
+  turnMetrics.mark(sessionId, "generationEnd");
 
   const followUpId = await sessionRepository.insertQuestionAskedRow(
     sessionId,
@@ -249,14 +332,24 @@ async function askFollowUp(io, sessionId, session, reason) {
   });
   await sessionRepository.updateSessionSection(sessionId, session.currentSection, followUpId);
 
+  // text is new here — followup.started previously carried no text field at
+  // all, so the frontend had to wait for the later transcript.final to
+  // back-fill it (see interviewEngineRoomSlice.js). Emitted before speak()
+  // so the candidate sees it first.
   await emitEnvelope(io, sessionId, "followup.started", {
     section: session.currentSection,
     questionId: followUpId,
     parentQuestionId: session.currentQuestionAskedId,
     reason,
+    text: followUpText,
   });
 
   await speak(io, sessionId, followUpText);
+
+  // doc/real_time_interview_communication_improvement.md Phase 8: the
+  // follow-up has now actually been spoken and the backend is genuinely
+  // waiting on a voice answer — this is the real "Listening..." moment.
+  await emitEnvelope(io, sessionId, "ai.listening", {});
 }
 
 // After a primary question's thread fully concludes (no follow-up, or the
@@ -321,9 +414,13 @@ async function askNextQuestion(io, sessionId, section) {
   );
 
   if (interactionType === "MCQ") {
+    turnMetrics.mark(sessionId, "generationStart");
     const mcq = await timed(sessionId, "mcq-generation", () =>
-      questionGenerator.generateMcqQuestion(section, history, extraContext)
+      questionGenerator.generateMcqQuestion(section, history, extraContext, {
+        signal: conversationGate.getSignal(sessionId),
+      })
     );
+    turnMetrics.mark(sessionId, "generationEnd");
 
     const questionId = await sessionRepository.insertQuestionAskedRow(
       sessionId,
@@ -359,9 +456,16 @@ async function askNextQuestion(io, sessionId, section) {
     return;
   }
 
+  // Requested UX fix (2026-08-26): same persist-then-speak restoration as
+  // askFollowUp — see that function's comment for why. Same shape the MCQ
+  // branch just above already uses: generate the full text first, persist +
+  // emit question.started (text visible immediately), THEN speak it.
+  const signal = conversationGate.getSignal(sessionId);
+  turnMetrics.mark(sessionId, "generationStart");
   const questionText = await timed(sessionId, "question-generation", () =>
-    questionGenerator.generateQuestion(section, history, extraContext)
+    questionGenerator.generateQuestion(section, history, extraContext, { signal })
   );
+  turnMetrics.mark(sessionId, "generationEnd");
 
   const questionId = await sessionRepository.insertQuestionAskedRow(
     sessionId,
@@ -389,11 +493,18 @@ async function askNextQuestion(io, sessionId, section) {
   });
 
   await speak(io, sessionId, questionText);
+
+  // doc/real_time_interview_communication_improvement.md Phase 8: the
+  // question has now actually been spoken and the backend is genuinely
+  // waiting on a voice answer — this is the real "Listening..." moment. Not
+  // emitted for MCQ (that branch returns before reaching here) — a click,
+  // not a voice answer, is expected.
+  await emitEnvelope(io, sessionId, "ai.listening", {});
 }
 
 // "Interview Room – Complete Interview Flow & Implementation
 // Requirements.md" §5/§12: MCQ's answer path — parallel to
-// handleCodingSubmission (turnGate-wrapped, not routed through handleAnswer,
+// handleCodingSubmission (conversationGate-wrapped, not routed through handleAnswer,
 // since there's no STT/utterance involved), not handleAnswer. Deliberately
 // does not reveal correctness to the client in real time (a real interviewer
 // doesn't flash "wrong!" mid-interview) — correctness is scored later by
@@ -415,7 +526,7 @@ async function handleMcqSubmission(io, sessionId, { questionAskedId, selectedOpt
     return;
   }
 
-  turnGate.setAiBusy(sessionId);
+  const { turnId } = conversationGate.setAiBusy(sessionId);
   try {
     await sessionRepository.recordMcqAnswer(questionAskedId, selectedOption);
     await sessionStore.appendHistory(sessionId, {
@@ -429,8 +540,17 @@ async function handleMcqSubmission(io, sessionId, { questionAskedId, selectedOpt
     });
 
     await advanceOrAskNext(io, sessionId);
+  } catch (err) {
+    // doc/real_time_interview_communication_improvement.md Phase 9: see
+    // handleSkip's identical comment above.
+    if (!conversationGate.isCurrentTurn(sessionId, turnId)) {
+      logger.info(`handleMcqSubmission superseded by a newer turn sessionId=${sessionId}`);
+    } else {
+      logger.error(`handleMcqSubmission failed sessionId=${sessionId}:`, err.message);
+      await speakRecovery(io, sessionId);
+    }
   } finally {
-    turnGate.releaseAiBusy(sessionId);
+    conversationGate.releaseAiBusy(sessionId, turnId);
   }
 }
 
@@ -508,7 +628,7 @@ async function handleCodingSubmission(io, sessionId, { code, language } = {}) {
     return;
   }
 
-  turnGate.setAiBusy(sessionId);
+  const { turnId } = conversationGate.setAiBusy(sessionId);
   try {
     const problem = session.currentCodingProblem;
     const evaluation = await codeEvaluator.evaluateSubmission({
@@ -542,8 +662,17 @@ async function handleCodingSubmission(io, sessionId, { code, language } = {}) {
     }
 
     await advanceCoding(io, sessionId);
+  } catch (err) {
+    // doc/real_time_interview_communication_improvement.md Phase 9: see
+    // handleSkip's identical comment above.
+    if (!conversationGate.isCurrentTurn(sessionId, turnId)) {
+      logger.info(`handleCodingSubmission superseded by a newer turn sessionId=${sessionId}`);
+    } else {
+      logger.error(`handleCodingSubmission failed sessionId=${sessionId}:`, err.message);
+      await speakRecovery(io, sessionId);
+    }
   } finally {
-    turnGate.releaseAiBusy(sessionId);
+    conversationGate.releaseAiBusy(sessionId, turnId);
   }
 }
 
@@ -580,25 +709,26 @@ async function transitionToSection(io, sessionId, section) {
   }
 
   if (section === "CASE") {
-    // 03-LIVE-INTERVIEW-MODULE.md §8: case.started -> AI narrates the case ->
-    // case.presented, which sets the awaitingCaseAcknowledgement gate. No
-    // question is asked here — caseFlowController.acknowledgeCase() is the
-    // only path into the CASE question loop, triggered by the candidate's
-    // explicit case.acknowledged.
+    // 03-LIVE-INTERVIEW-MODULE.md §8: case.started -> case.presented, which
+    // sets the awaitingCaseAcknowledgement gate. No question is asked here —
+    // caseFlowController.acknowledgeCase() is the only path into the CASE
+    // question loop, triggered by the candidate's explicit case.acknowledged.
     await emitEnvelope(io, sessionId, "case.started", {});
     const session = await sessionStore.getSession(sessionId);
     const caseContentText = session && session.caseContentText;
-    // caseContentText is populated asynchronously right after connect
-    // (communication/socketServer.js's buildAndCacheResumeContext) — normally
-    // there's plenty of time for it to resolve before CASE is naturally
-    // reached, but Section Skip can land here almost immediately. Previously
-    // the AI stayed completely silent in that case (speak() was only called
-    // when caseContentText already existed) while still gating the room on
-    // "read the case" — always speak something instead.
-    const presentation = caseContentText
-      ? await questionGenerator.generateCasePresentation(caseContentText)
-      : "Let's move on to the case study. Take a moment to read through the case, and continue when you're ready.";
-    await speak(io, sessionId, presentation, { cacheable: !caseContentText });
+    // Requested UX fix (2026-08-26): the AI no longer narrates the case
+    // content itself — the candidate reads it on screen via the existing
+    // CasePresentation.js reading panel (driven by case.presented's own
+    // `content` field below, unaffected by this). This is now the same
+    // short static line unconditionally, whether or not caseContentText is
+    // available yet (previously only the "not available yet" fallback used
+    // this line) — no LLM call needed at all any more.
+    // doc/real_time_interview_communication_improvement.md Phase 6's
+    // generateCasePresentation(Stream) are left in place, just no longer
+    // called from here.
+    const presentation =
+      "This is the case study section. Please take a moment to read the case study on your screen, and when you're ready, we'll begin the questions on it.";
+    await speak(io, sessionId, presentation, { cacheable: true });
     // Lazy require to avoid a circular require (caseFlowController lazily
     // requires this module back, to call askNextQuestion on acknowledgement).
     const caseFlowController = require("../case-study/caseFlowController");
@@ -634,52 +764,103 @@ async function transitionToSection(io, sessionId, section) {
 // handful of fully-static phrases (greeting, fixed transition/completion
 // lines) — those skip the network round trip entirely on every call after
 // the first (speech/ttsCache.js).
-async function speak(io, sessionId, text, { cacheable = false } = {}) {
+// doc/real_time_interview_communication_improvement.md Phase 6/7: the
+// tiered TTS fallback (cache/stream -> plain non-streaming -> silence) that
+// used to live inline in speak() below, extracted so speakGenerated() can
+// reuse it per-sentence without also re-running the once-per-response
+// envelope/transcript/turnMetrics.finish lifecycle. Same behavior as
+// before: a genuine TTS failure never throws (cascades to silence instead);
+// a deliberate barge-in cancellation (signal.aborted) does throw, and is
+// NOT retried through the remaining tiers — the candidate has already
+// moved on to a new turn. onFirstAudio (optional) fires exactly once, at
+// the earliest moment any audio for THIS text is about to play — callers
+// use it to mark ttsFirstAudio/playbackStart themselves, since for a
+// multi-sentence response only the very first sentence's "first audio"
+// should count, not each sentence's.
+async function synthesizeAndPlay(sessionId, text, { cacheable = false, signal, turnId, onFirstAudio } = {}) {
   const startedAt = Date.now();
-  await emitEnvelope(io, sessionId, "ai.response.started", {});
-  await emitEnvelope(io, sessionId, "ai.speaking", {});
-
   let pcm;
   let firstChunkMs;
 
-  // Tiered fallback — cache/stream -> plain non-streaming call -> silence.
-  // A TTS failure must never throw out of speak(): that would abort
-  // whatever called it (transitionToSection, askNextQuestion, ...), and
-  // since startInterview's very first speak() call is the greeting, an
-  // unprotected throw here used to be able to kill the entire interview
-  // before it ever started, with only a generic "session.warning" reaching
-  // the frontend (previously misread as a connection problem — see
-  // ConnectionStatusBadge.js). Every tier below is now covered.
+  function markFirstAudio() {
+    if (firstChunkMs === undefined) firstChunkMs = Date.now() - startedAt;
+    if (onFirstAudio) onFirstAudio();
+  }
+
   try {
     if (cacheable) {
-      pcm = await ttsCache.getOrSynthesize(text);
-      firstChunkMs = Date.now() - startedAt;
-      await audioOutbound.playPcmBuffer(sessionId, pcm);
+      pcm = await ttsCache.getOrSynthesize(text, { signal });
+      markFirstAudio();
+      await audioOutbound.playPcmBuffer(sessionId, pcm, turnId);
     } else {
       let lastPlayback = Promise.resolve();
-      pcm = await ttsClient.synthesizeSpeechStreaming(text, (chunk) => {
-        if (firstChunkMs === undefined) firstChunkMs = Date.now() - startedAt;
-        lastPlayback = audioOutbound.playPcmBuffer(sessionId, chunk);
-      });
+      pcm = await ttsClient.synthesizeSpeechStreaming(
+        text,
+        (chunk) => {
+          markFirstAudio();
+          lastPlayback = audioOutbound.playPcmBuffer(sessionId, chunk, turnId);
+        },
+        { signal }
+      );
       await lastPlayback;
     }
   } catch (err) {
+    if (signal?.aborted) {
+      logger.info(`synthesizeAndPlay cancelled by barge-in sessionId=${sessionId}`);
+      throw err;
+    }
     logger.warn(`TTS (${cacheable ? "cached" : "streaming"}) failed sessionId=${sessionId}, falling back to non-streaming:`, err.message);
     try {
-      pcm = await ttsClient.synthesizeSpeech(text);
-      firstChunkMs = Date.now() - startedAt;
-      await audioOutbound.playPcmBuffer(sessionId, pcm);
+      pcm = await ttsClient.synthesizeSpeech(text, { signal });
+      markFirstAudio();
+      await audioOutbound.playPcmBuffer(sessionId, pcm, turnId);
     } catch (fallbackErr) {
+      if (signal?.aborted) {
+        logger.info(`synthesizeAndPlay cancelled by barge-in sessionId=${sessionId}`);
+        throw fallbackErr;
+      }
       logger.error(`TTS fully failed sessionId=${sessionId}, continuing with silence:`, fallbackErr.message);
       pcm = ttsClient.silentPcmBuffer(ttsClient.SILENCE_FALLBACK_MS);
-      firstChunkMs = Date.now() - startedAt;
-      await audioOutbound.playPcmBuffer(sessionId, pcm);
+      markFirstAudio();
+      await audioOutbound.playPcmBuffer(sessionId, pcm, turnId);
     }
   }
 
-  logger.info(
-    `timing sessionId=${sessionId} label=tts firstChunkMs=${firstChunkMs} totalMs=${Date.now() - startedAt} cached=${cacheable}`
-  );
+  return { pcm, firstChunkMs, totalMs: Date.now() - startedAt };
+}
+
+// Thin wrapper around synthesizeAndPlay for a single already-known piece of
+// text — everything that's specific to "this is one whole AI turn" (the
+// surrounding envelopes, transcript, history, visemes, turnMetrics.finish)
+// lives here, not in synthesizeAndPlay itself. External behavior is
+// unchanged from before this extraction: a genuine TTS failure still never
+// throws; a deliberate abort still does (synthesizeAndPlay's throw
+// propagates straight out, same as before).
+async function speak(io, sessionId, text, { cacheable = false } = {}) {
+  // doc/real_time_interview_communication_improvement.md Phase 3: captured
+  // once, here — never re-read from conversationGate later. By the time a
+  // catch/callback below runs, a barge-in may already have moved the
+  // session on to a newer turn with its own fresh, non-aborted signal; only
+  // this original reference correctly reflects whether THIS call got cancelled.
+  const signal = conversationGate.getSignal(sessionId);
+  const turnId = conversationGate.getTurnId(sessionId);
+  turnMetrics.mark(sessionId, "ttsStart");
+  await emitEnvelope(io, sessionId, "ai.response.started", {});
+  await emitEnvelope(io, sessionId, "ai.speaking", {});
+
+  const { pcm, firstChunkMs, totalMs } = await synthesizeAndPlay(sessionId, text, {
+    cacheable,
+    signal,
+    turnId,
+    onFirstAudio: () => {
+      turnMetrics.mark(sessionId, "ttsFirstAudio");
+      turnMetrics.mark(sessionId, "playbackStart");
+    },
+  });
+  turnMetrics.mark(sessionId, "playbackEnd");
+
+  logger.info(`timing sessionId=${sessionId} label=tts firstChunkMs=${firstChunkMs} totalMs=${totalMs} cached=${cacheable}`);
+  turnMetrics.finish(sessionId);
 
   await emitEnvelope(io, sessionId, "transcript.final", { speaker: "ai", text });
   sessionRepository.insertTranscriptRow(sessionId, "ai", text);
@@ -697,6 +878,166 @@ async function speak(io, sessionId, text, { cacheable = false } = {}) {
   await emitEnvelope(io, sessionId, "ai.visemes", envelope);
 
   await emitEnvelope(io, sessionId, "ai.response.completed", {});
+}
+
+// doc/real_time_interview_communication_improvement.md Phase 9 (§19: "do not
+// leave the interviewer stuck in AI_THINKING" / STT failure "do not lose
+// session, allow retry"). Last-resort recovery for the five candidate-
+// triggered entry points below (onCandidateUtterance, handleSkip,
+// handleSkipSection, handleMcqSubmission, handleCodingSubmission): each
+// already runs through several fallback tiers before anything reaches here
+// (sttStreamClient's realtime->batch, synthesizeAndPlay's stream->plain->
+// silence, speakGenerated's stream->batch) — this only fires once ALL of
+// those have also genuinely failed. Speaking something (rather than just
+// logging) is what actually unsticks the frontend: speak()'s own
+// ai.response.started/ai.speaking/ai.response.completed sequence moves
+// aiState out of whatever it was stuck in, with no new envelope type needed.
+// Never retries the failed operation itself — several callers have already
+// run non-idempotent side effects (transcript rows, history appends) before
+// the point of failure, so re-running the whole handler risks duplicates;
+// the existing fallback tiers are the retry layer, this is just "don't go
+// silent when even those are exhausted." Must never throw itself (wrapped in
+// its own try/catch) — a secondary failure here must not prevent the
+// caller's own finally { conversationGate.releaseAiBusy(...) } from running.
+const RECOVERY_MESSAGE = "Sorry, I ran into a brief technical issue there. Let's continue.";
+async function speakRecovery(io, sessionId, { expectAnswer = false } = {}) {
+  try {
+    await speak(io, sessionId, RECOVERY_MESSAGE, { cacheable: true });
+    // Only onCandidateUtterance passes expectAnswer: true — that's the one
+    // context where the candidate's prior answer genuinely was never
+    // processed and they're expected to speak again. The other four entry
+    // points have no pending question at the point of failure, so they
+    // leave listening unclaimed rather than falsely implying one.
+    if (expectAnswer) await emitEnvelope(io, sessionId, "ai.listening", {});
+  } catch (err) {
+    logger.error(`speakRecovery itself failed sessionId=${sessionId}:`, err.message);
+  }
+}
+
+// doc/real_time_interview_communication_improvement.md Phases 6+7: streams
+// an LLM reply sentence-by-sentence, synthesizing+playing (Phase 7's
+// pipelined "TTS queue") each sentence as soon as it's chunked rather than
+// waiting for the whole reply — "first meaningful sentence -> TTS starts ->
+// remaining LLM response continues," not "wait for the entire response."
+// streamFn(): () => Promise<AsyncIterable<{content: string}>> — an
+// llmClient.generateReplyStream call already bound with history/systemPrompt/
+// signal, matching timed()'s "caller provides a thunk" style. fallbackFn():
+// () => Promise<string> — the plain batch generateX equivalent, used only if
+// the stream itself genuinely fails (not on a barge-in abort).
+async function speakGenerated(io, sessionId, streamFn, fallbackFn) {
+  const signal = conversationGate.getSignal(sessionId);
+  const turnId = conversationGate.getTurnId(sessionId);
+  turnMetrics.mark(sessionId, "ttsStart");
+  await emitEnvelope(io, sessionId, "ai.response.started", {});
+  await emitEnvelope(io, sessionId, "ai.speaking", {});
+
+  let fullText = "";
+  let sentenceBuffer = "";
+  let playbackChain = Promise.resolve();
+  let firstSentencePcm = null;
+  let isFirstSentence = true;
+  let firstAudioMarked = false;
+
+  function markFirstAudioOnce() {
+    if (firstAudioMarked) return;
+    firstAudioMarked = true;
+    turnMetrics.mark(sessionId, "ttsFirstAudio");
+    turnMetrics.mark(sessionId, "playbackStart");
+  }
+
+  function enqueueSentence(sentence) {
+    const captureAsFirst = isFirstSentence;
+    isFirstSentence = false;
+    // Chained (not awaited here) so sentence N+1 can start synthesizing as
+    // soon as it's chunked, without waiting for sentence N's *playback* to
+    // finish — this is Phase 7's queue: no dead-air gap between sentences
+    // waiting purely on TTS latency.
+    playbackChain = playbackChain.then(async () => {
+      const result = await synthesizeAndPlay(sessionId, sentence, {
+        cacheable: false,
+        signal,
+        turnId,
+        onFirstAudio: markFirstAudioOnce,
+      });
+      if (captureAsFirst) firstSentencePcm = result.pcm;
+    });
+  }
+
+  try {
+    const stream = await streamFn();
+    let firstTokenMarked = false;
+    // doc/real_time_interview_communication_improvement.md Phase 9 (§19 "LLM
+    // timeout"): llmClient.js's own timeout only bounds getting the stream
+    // started — once flowing, a stall between chunks (no error, just no more
+    // data) would otherwise hang this loop, and the turn, forever. Each
+    // .next() is raced against the same requestTimeoutMs budget; a stall
+    // throws a plain Error, falling into the catch below exactly like any
+    // other genuine streaming failure (-> fallbackFn() -> speak()).
+    const iterator = stream[Symbol.asyncIterator]();
+    while (true) {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`LLM stream stalled for ${env.openai.requestTimeoutMs}ms`)),
+          env.openai.requestTimeoutMs
+        );
+      });
+      let step;
+      try {
+        step = await Promise.race([iterator.next(), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (step.done) break;
+      const chunk = step.value;
+
+      if (!firstTokenMarked) {
+        turnMetrics.mark(sessionId, "llmFirstToken");
+        firstTokenMarked = true;
+      }
+      fullText += chunk.content || "";
+      sentenceBuffer += chunk.content || "";
+      const { sentences, remainder } = sentenceChunker.extractCompleteSentences(sentenceBuffer);
+      sentenceBuffer = remainder;
+      for (const sentence of sentences) enqueueSentence(sentence);
+    }
+    if (sentenceBuffer.trim()) enqueueSentence(sentenceBuffer.trim());
+    await playbackChain;
+  } catch (err) {
+    if (signal?.aborted) {
+      logger.info(`speakGenerated cancelled by barge-in sessionId=${sessionId}`);
+      throw err;
+    }
+    logger.warn(`Streaming LLM->TTS failed sessionId=${sessionId}, falling back to non-streamed generation:`, err.message);
+    const text = await fallbackFn();
+    await speak(io, sessionId, text);
+    return text;
+  }
+
+  turnMetrics.mark(sessionId, "playbackEnd");
+  turnMetrics.finish(sessionId);
+
+  // Matches every batch generateX()'s own .trim() on the raw LLM output —
+  // fullText accumulates every chunk's exact characters (trailing
+  // whitespace on the final chunk included), unlike sentenceBuffer, which
+  // gets its leading whitespace trimmed at each confirmed sentence boundary.
+  fullText = fullText.trim();
+
+  await emitEnvelope(io, sessionId, "transcript.final", { speaker: "ai", text: fullText });
+  sessionRepository.insertTranscriptRow(sessionId, "ai", fullText);
+  await sessionStore.appendHistory(sessionId, { role: "assistant", content: fullText });
+
+  // Approximated from the first sentence's audio only, not every sentence —
+  // consistent with this codebase's existing viseme approach already being
+  // a "good enough, not sample-accurate" amplitude-envelope estimate (see
+  // speak()'s own comment above), not a new regression.
+  if (firstSentencePcm) {
+    const envelope = visemeEstimator.estimateEnvelope(firstSentencePcm);
+    await emitEnvelope(io, sessionId, "ai.visemes", envelope);
+  }
+
+  await emitEnvelope(io, sessionId, "ai.response.completed", {});
+  return fullText;
 }
 
 async function endSession(io, sessionId, reason) {
@@ -735,8 +1076,11 @@ async function endSession(io, sessionId, reason) {
   await emitEnvelope(io, sessionId, "interview.state", { status: "COMPLETED", current_section: null });
 
   // Lazy require to avoid a circular require with peerConnectionManager
-  // (which lazily requires this module to fire the AI greeting on connect).
+  // (which lazily requires this module to fire the AI greeting on connect),
+  // and with audioInbound (which lazily requires this module to hand off a
+  // flushed utterance).
   const peerConnectionManager = require("../webrtc/peerConnectionManager");
+  const audioInbound = require("../webrtc/audioInbound");
   peerConnectionManager.closePeerConnection(sessionId);
 
   // doc 04 §12's final timeline event — emitted before the Redis cleanup
@@ -744,8 +1088,14 @@ async function endSession(io, sessionId, reason) {
   // place in the ordered log instead of restarting the sequence at 1.
   await emitEnvelope(io, sessionId, "session.closed", { reason: reason || "candidate_ended" });
 
-  turnGate.clearSession(sessionId);
+  conversationGate.clearSession(sessionId);
   audioOutbound.clearSession(sessionId);
+  // doc/real_time_interview_communication_improvement.md Phase 5: also
+  // closes any still-open realtime STT WebSocket — audioInbound.clearSession
+  // itself calls sttStreamClient.closeSession, so this one call covers both
+  // (previously missing here entirely, a small pre-existing gap found while
+  // adding the new one).
+  audioInbound.clearSession(sessionId);
   await sessionStore.endSession(sessionId);
 }
 

@@ -22,8 +22,8 @@ Candidate's answer: "${answer}"
 Respond with strict JSON only, no other text: {"followUp": boolean, "reason": string}
 `.trim();
 
-async function shouldFollowUp(question, answer) {
-  const result = await llmClient.generateJson(PROMPT_TEMPLATE(question, answer));
+async function shouldFollowUp(question, answer, { signal } = {}) {
+  const result = await llmClient.generateJson(PROMPT_TEMPLATE(question, answer), { signal });
   if (!result || typeof result.followUp !== "boolean") {
     // Fail safe: if the model didn't comply, don't follow up — matches the
     // "be conservative" instruction rather than drilling the candidate.

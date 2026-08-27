@@ -10,11 +10,11 @@ const ttsClient = require("./ttsClient");
 // start, interview end).
 const cache = new Map();
 
-async function getOrSynthesize(text) {
+async function getOrSynthesize(text, { signal } = {}) {
   const cached = cache.get(text);
   if (cached) return cached;
 
-  const pcm = await ttsClient.synthesizeSpeech(text);
+  const pcm = await ttsClient.synthesizeSpeech(text, { signal });
   cache.set(text, pcm);
   return pcm;
 }

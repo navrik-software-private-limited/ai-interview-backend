@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const candidateRepository = require("./candidateRepository");
 const sessionRepository = require("./sessionRepository");
+const { getIceServers } = require("../webrtc/iceServersConfig");
 const logger = require("../logs/logger");
 
 // Service-to-service only (middleware/verifyInternalServiceKey.js) — trusts
@@ -93,7 +94,7 @@ async function joinSession(req, res) {
     });
   }
 
-  return res.status(200).json({ success: true, sessionId, status, iceServers: [] });
+  return res.status(200).json({ success: true, sessionId, status, iceServers: getIceServers() });
 }
 
 module.exports = { createSession, joinSession };

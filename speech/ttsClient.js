@@ -23,7 +23,7 @@ function silentPcmBuffer(ms) {
 // Kept for speech/ttsCache.js's cached static phrases, where the whole
 // buffer is wanted upfront anyway; the live speak() path uses
 // synthesizeSpeechStreaming below instead.
-async function synthesizeSpeech(text) {
+async function synthesizeSpeech(text, { signal } = {}) {
   if (!env.elevenLabs.apiKey || !env.elevenLabs.ttsVoiceId) {
     logger.warn("ELEVENLABS_API_KEY/ELEVENLABS_TTS_VOICE_ID not set — skipping real TTS, playing silence instead");
     return silentPcmBuffer(SILENCE_FALLBACK_MS);
@@ -38,6 +38,7 @@ async function synthesizeSpeech(text) {
       headers: { "xi-api-key": env.elevenLabs.apiKey, "Content-Type": "application/json" },
       responseType: "arraybuffer",
       maxBodyLength: Infinity,
+      signal,
     }
   );
 
@@ -53,7 +54,7 @@ async function synthesizeSpeech(text) {
 // response. Resolves with the complete concatenated buffer once the stream
 // ends, for callers that also need the full audio (viseme envelope,
 // transcript persistence).
-async function synthesizeSpeechStreaming(text, onChunk) {
+async function synthesizeSpeechStreaming(text, onChunk, { signal } = {}) {
   if (!env.elevenLabs.apiKey || !env.elevenLabs.ttsVoiceId) {
     logger.warn("ELEVENLABS_API_KEY/ELEVENLABS_TTS_VOICE_ID not set — skipping real TTS, playing silence instead");
     const silence = silentPcmBuffer(SILENCE_FALLBACK_MS);
@@ -70,14 +71,32 @@ async function synthesizeSpeechStreaming(text, onChunk) {
       headers: { "xi-api-key": env.elevenLabs.apiKey, "Content-Type": "application/json" },
       responseType: "stream",
       maxBodyLength: Infinity,
+      signal,
     }
   );
 
   return new Promise((resolve, reject) => {
     const chunks = [];
     let pending = Buffer.alloc(0);
+    let settled = false;
+
+    // doc/real_time_interview_communication_improvement.md Phase 3: axios's
+    // own `signal` support aborts the underlying request, but for an
+    // already-open stream that can land as either a "data"-stream error or
+    // just silence with no further events — listening for the abort
+    // directly guarantees this promise always settles either way.
+    function onAbort() {
+      if (settled) return;
+      settled = true;
+      response.data.destroy();
+      const err = new Error("TTS streaming aborted");
+      err.name = "AbortError";
+      reject(err);
+    }
+    signal?.addEventListener("abort", onAbort);
 
     response.data.on("data", (data) => {
+      if (settled) return;
       pending = Buffer.concat([pending, data]);
       while (pending.length >= STREAM_CHUNK_BYTES) {
         const chunk = pending.subarray(0, STREAM_CHUNK_BYTES);
@@ -88,6 +107,9 @@ async function synthesizeSpeechStreaming(text, onChunk) {
     });
 
     response.data.on("end", () => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
       if (pending.length > 0) {
         chunks.push(pending);
         if (onChunk) onChunk(pending);
@@ -95,7 +117,12 @@ async function synthesizeSpeechStreaming(text, onChunk) {
       resolve(Buffer.concat(chunks));
     });
 
-    response.data.on("error", reject);
+    response.data.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      reject(err);
+    });
   });
 }
 

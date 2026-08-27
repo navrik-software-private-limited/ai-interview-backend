@@ -7,11 +7,20 @@ const sessionStore = require("../session/sessionStore");
 const sessionRepository = require("../session/sessionRepository");
 const { EVENT_NAME, emitEnvelope } = require("./envelope");
 const peerConnectionManager = require("../webrtc/peerConnectionManager");
+const { getIceServers } = require("../webrtc/iceServersConfig");
+const conversationGate = require("../webrtc/conversationGate");
+const audioOutbound = require("../webrtc/audioOutbound");
+const audioInbound = require("../webrtc/audioInbound");
 const interviewController = require("../interviewer/interviewController");
+const evaluationPipeline = require("../evaluation/evaluationPipeline");
 const textExtractor = require("../jd-resume/textExtractor");
 const contextBuilder = require("../jd-resume/contextBuilder");
 const faceTrackingService = require("../face-tracking/faceTrackingService");
 const caseFlowController = require("../case-study/caseFlowController");
+const activityMonitorService = require("../proctoring/activityMonitorService");
+const codingActivityService = require("../proctoring/codingActivityService");
+const { forwardConnectivityEvent } = require("../proctoring/sources/connectivityEventAdapter");
+const { SEVERITY } = require("../proctoring/severityClassifier");
 
 // sessionId -> pending abandonment Timeout, armed on disconnect and cleared
 // on reconnect within the grace period (doc 03 §13: "should not immediately
@@ -76,16 +85,6 @@ async function isSessionJoinable(sessionId) {
   return status === "READY" || status === "ACTIVE";
 }
 
-// 06-READINESS-CHECK-MODULE.md / 03-LIVE-INTERVIEW-MODULE.md §2.5: the
-// session cannot reach ACTIVE until readiness has put it in READY — this is
-// the structural enforcement (not just a frontend convention) of "the
-// interview cannot start until all four readiness checks pass." ACTIVE stays
-// allowed so a mid-interview reconnect is never bounced back to readiness.
-async function isSessionJoinable(sessionId) {
-  const status = await sessionRepository.fetchSessionStatus(sessionId);
-  return status === "READY" || status === "ACTIVE";
-}
-
 async function handleSessionConnect(io, socket, ctx) {
   const pendingAbandon = disconnectTimers.get(ctx.sessionId);
   if (pendingAbandon) {
@@ -104,7 +103,11 @@ async function handleSessionConnect(io, socket, ctx) {
     buildAndCacheResumeContext(ctx.sessionId);
   }
 
-  await emitEnvelope(io, ctx.sessionId, "session.ready", { resumed });
+  // doc/07_INTERVIEW_MODULE_STATUS_AND_ROADMAP.md gap #3: the frontend has no
+  // other channel that reaches it before WebRTC negotiation begins, so this
+  // is how the browser's RTCPeerConnection actually learns about TURN (once
+  // configured) — see practywiz-frontend's useWebRTC.js.
+  await emitEnvelope(io, ctx.sessionId, "session.ready", { resumed, iceServers: getIceServers() });
   logger.info(`session.ready sessionId=${ctx.sessionId} resumed=${resumed}`);
 }
 
@@ -156,6 +159,12 @@ async function routeInboundEnvelope(io, socket, sessionId, envelope) {
     case "face.status":
       await faceTrackingService.handleFaceEvent(io, sessionId, envelope.payload);
       break;
+    case "activity.status":
+      await activityMonitorService.handleActivityEvent(io, sessionId, envelope.payload);
+      break;
+    case "coding.activity":
+      await codingActivityService.handlePasteEvent(io, sessionId, envelope.payload);
+      break;
     case "case.acknowledged":
       await caseFlowController.acknowledgeCase(io, sessionId);
       break;
@@ -181,8 +190,34 @@ async function handleAbandoned(io, sessionId) {
   disconnectTimers.delete(sessionId);
   logger.info(`session abandoned (no reconnect within grace period) sessionId=${sessionId}`);
   await emitEnvelope(io, sessionId, "session.failed", { reason: "abandoned" });
+  // doc/07 gap #4: the candidate never reconnected — real integrity-relevant
+  // evidence, not just a connectivity blip.
+  forwardConnectivityEvent(io, sessionId, { eventType: "SESSION_ABANDONED", severity: SEVERITY.CRITICAL });
   peerConnectionManager.closePeerConnection(sessionId);
   await sessionRepository.markSessionAbandoned(sessionId);
+
+  // doc/07_INTERVIEW_MODULE_STATUS_AND_ROADMAP.md gap #11: this used to be a
+  // dead end — no report was ever generated for a session that never
+  // reconnected, leaving it stuck showing "Interview in progress" on the
+  // Reports tab forever. ABANDONED is just as terminal as COMPLETED (see
+  // evaluation/sessionDataLoader.js's TERMINAL_STATUSES), and every evaluator
+  // downstream already degrades to "Insufficient data" for thin/empty input,
+  // so this is safe even for a session abandoned seconds in. Same
+  // fire-and-forget pattern as interviewer/interviewController.js's
+  // endSession — must never block/delay cleanup below.
+  await emitEnvelope(io, sessionId, "report.started", {});
+  evaluationPipeline.generateReport(sessionId).catch((err) => {
+    logger.error(`report generation failed sessionId=${sessionId}:`, err.message);
+  });
+
+  // doc/real_time_interview_communication_improvement.md Phase 5: found
+  // while adding sttStreamClient's own teardown — interviewController.js's
+  // endSession already clears these three (a clean finish), but this
+  // abandonment path never did, leaking each session's in-memory turn/
+  // playback/VAD/STT-stream state indefinitely. Same cleanup, same order.
+  conversationGate.clearSession(sessionId);
+  audioOutbound.clearSession(sessionId);
+  audioInbound.clearSession(sessionId);
   await sessionStore.endSession(sessionId);
 }
 
@@ -196,6 +231,9 @@ async function handleDisconnect(io, socket, reason) {
     reason: "connection_lost",
     graceMs: env.reconnectGracePeriodMs,
   });
+  // doc/07 gap #4: connectivity-monitor proctoring source — forwards an
+  // already-detected condition, no new client instrumentation needed.
+  forwardConnectivityEvent(io, ctx.sessionId, { eventType: "SESSION_DISCONNECTED", severity: SEVERITY.WARNING, metadata: { reason } });
 
   const timer = setTimeout(() => handleAbandoned(io, ctx.sessionId), env.reconnectGracePeriodMs);
   disconnectTimers.set(ctx.sessionId, timer);

@@ -4,6 +4,9 @@ const { RTCAudioSink, RTCAudioSource } = nonstandard;
 const logger = require("../logs/logger");
 const { emitEnvelope } = require("../communication/envelope");
 const audioInbound = require("./audioInbound");
+const { getIceServers } = require("./iceServersConfig");
+const { forwardConnectivityEvent } = require("../proctoring/sources/connectivityEventAdapter");
+const { SEVERITY } = require("../proctoring/severityClassifier");
 
 // sessionId -> { pc, audioSource, outboundTrack, audioSink, hasStartedInterview, isDegraded }
 const peerConnections = new Map();
@@ -21,7 +24,7 @@ async function handleOffer(sessionId, sdp, io) {
     return;
   }
 
-  const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+  const pc = new RTCPeerConnection({ iceServers: getIceServers() });
 
   // Terminates the candidate's camera; frames are not consumed until Phase 3
   // face tracking is built.
@@ -56,6 +59,9 @@ async function handleOffer(sessionId, sdp, io) {
       if (entry && entry.isDegraded) {
         entry.isDegraded = false;
         emitEnvelope(io, sessionId, "media.recovered", {});
+        // doc/07 gap #4: INFORMATIONAL so recovery never adds to the
+        // integrity-score penalty — mirrors FACE_PRESENT's role.
+        forwardConnectivityEvent(io, sessionId, { eventType: "MEDIA_RECOVERED", severity: SEVERITY.INFORMATIONAL });
       }
 
       if (entry && !entry.hasStartedInterview) {
@@ -83,10 +89,14 @@ async function handleOffer(sessionId, sdp, io) {
     if (pc.connectionState === "disconnected") {
       if (entry) entry.isDegraded = true;
       emitEnvelope(io, sessionId, "media.degraded", {});
+      // doc/07 gap #4: connectivity-monitor proctoring source — forwards an
+      // already-detected condition, no new client instrumentation needed.
+      forwardConnectivityEvent(io, sessionId, { eventType: "MEDIA_DEGRADED", severity: SEVERITY.WARNING });
     }
 
     if (pc.connectionState === "failed") {
       emitEnvelope(io, sessionId, "webrtc.failed", {});
+      forwardConnectivityEvent(io, sessionId, { eventType: "MEDIA_FAILED", severity: SEVERITY.CRITICAL });
     }
   };
 

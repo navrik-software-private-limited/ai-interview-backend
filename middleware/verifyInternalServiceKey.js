@@ -5,6 +5,7 @@ const env = require("../config/env");
 // this endpoint trusts practywiz-backend completely (it never re-checks
 // purchase ownership itself, per 00-MASTER-ARCHITECTURE.md §2's "no direct
 // database joins... all cross-service data flows through API calls").
+//hh
 function verifyInternalServiceKey(req, res, next) {
   const key = req.headers["x-internal-service-key"];
   if (!key || key !== env.internalServiceKey) {

@@ -49,11 +49,14 @@ async function assembleReport({
   skillResults,
   softSkills,
   languageProfile,
+  caseStudy,
   codingSubmissions,
   categoryScores,
   overallScore,
   strengths,
   weaknesses,
+  strengthsWithRefs,
+  weaknessesWithRefs,
   evidenceTrace,
   flatTranscript,
   proctoringSummary,
@@ -108,6 +111,12 @@ async function assembleReport({
     strengths: orInsufficientData(strengths),
     // 6. Weaknesses
     weaknesses: orInsufficientData(weaknesses),
+    // doc/07 gap #6: same bullets as 5/6 above, with their questionRef
+    // citation preserved — additive fields, not a replacement for the plain
+    // strengths/weaknesses arrays above (left unchanged for any consumer
+    // already reading those two fields).
+    strengths_evidence: orInsufficientData(strengthsWithRefs),
+    weaknesses_evidence: orInsufficientData(weaknessesWithRefs),
     // 7. Technical Skills Evaluation
     technical_skills_evaluation: orInsufficientData({
       categoryScore: categoryScores.technical,
@@ -123,6 +132,11 @@ async function assembleReport({
     // 9. Case Study Evaluation
     case_study_evaluation: orInsufficientData({
       categoryScore: categoryScores.case_analysis,
+      // doc 04 §7 / doc/07 gap #5: Understanding/Approach/Reasoning/
+      // Trade-offs/Technical-business-thinking/Communication — additive
+      // detail alongside the existing numeric categoryScore, which is left
+      // computed exactly as before (see evaluation/scoringAggregator.js).
+      dimensions: orInsufficientData(caseStudy),
       questions: questionsForSection(questionEvaluations, ["CASE"]),
     }),
     // 10. Coding Evaluation

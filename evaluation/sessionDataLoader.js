@@ -91,14 +91,24 @@ async function fetchCodingSubmissions(sessionId) {
   }));
 }
 
+// doc/07_INTERVIEW_MODULE_STATUS_AND_ROADMAP.md gap #11: ABANDONED (grace
+// period expired with no reconnect, communication/socketServer.js's
+// handleAbandoned) is just as terminal as COMPLETED — no more data will ever
+// be added to either — so it's allowed here too. The actual invariant this
+// guard protects is "never evaluate a still-live session", not "only ever
+// evaluate a clean finish"; every downstream evaluator already degrades to
+// "Insufficient data" for a session with a thin/empty transcript, so a
+// report generated from an abandoned session is not a special case for them.
+const TERMINAL_STATUSES = new Set(["COMPLETED", "ABANDONED"]);
+
 // Loads everything a report needs for one session, in one place. Throws if
-// the session doesn't exist or hasn't actually completed — a report must
-// never be generated from a live/in-progress session.
+// the session doesn't exist or hasn't actually reached a terminal state — a
+// report must never be generated from a live/in-progress session.
 async function loadSessionData(sessionId) {
   const session = await fetchSessionRow(sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
-  if (session.status !== "COMPLETED") {
-    throw new Error(`session ${sessionId} is not COMPLETED (status=${session.status}) — refusing to evaluate`);
+  if (!TERMINAL_STATUSES.has(session.status)) {
+    throw new Error(`session ${sessionId} is not in a terminal state (status=${session.status}) — refusing to evaluate`);
   }
 
   const [candidate, questionsAsked, transcripts, codingSubmissions, proctoringEvents, sessionContext] =

@@ -11,6 +11,7 @@ const { attachSocketServer } = require("./communication/socketServer");
 const proctoringRoutes = require("./proctoring/proctoringRoutes");
 const caseRoutes = require("./case-study/caseRoutes");
 const reportRoutes = require("./reporting/reportRoutes");
+const internalReportRoutes = require("./reporting/internalReportRoutes");
 const sessionRoutes = require("./session/sessionRoutes");
 const readinessRoutes = require("./readiness/readinessRoutes");
 const adminConfigRoutes = require("./admin/adminConfigRoutes");
@@ -35,6 +36,7 @@ app.use("/api/sessions", sessionRoutes);
 app.use("/api/sessions", readinessRoutes);
 app.use("/api/admin/interview-config", adminConfigRoutes);
 app.use("/api/candidates", candidateSessionsRoutes);
+app.use("/api/internal/sessions", internalReportRoutes);
 
 attachSocketServer(server);
 

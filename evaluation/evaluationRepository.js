@@ -93,8 +93,11 @@ async function upsertEvaluation(sessionId, evaluation) {
     .input("evidenceTrace", sql.NVarChar, JSON.stringify(evaluation.evidenceTrace || {}))
     .input("strengths", sql.NVarChar, JSON.stringify(evaluation.strengths || []))
     .input("weaknesses", sql.NVarChar, JSON.stringify(evaluation.weaknesses || []))
+    .input("strengthsWithRefs", sql.NVarChar, JSON.stringify(evaluation.strengthsWithRefs || []))
+    .input("weaknessesWithRefs", sql.NVarChar, JSON.stringify(evaluation.weaknessesWithRefs || []))
     .input("languageProfile", sql.NVarChar, JSON.stringify(evaluation.languageProfile || {}))
     .input("softSkills", sql.NVarChar, JSON.stringify(evaluation.softSkills || {}))
+    .input("caseStudy", sql.NVarChar, JSON.stringify(evaluation.caseStudy || {}))
     .query(`
       MERGE dbo.interview_evaluations AS target
       USING (SELECT @sessionId AS session_id) AS source
@@ -102,11 +105,14 @@ async function upsertEvaluation(sessionId, evaluation) {
       WHEN MATCHED THEN UPDATE SET
         overall_score = @overallScore, category_scores = @categoryScores, skill_results = @skillResults,
         evidence_trace = @evidenceTrace, strengths = @strengths, weaknesses = @weaknesses,
-        language_profile = @languageProfile, soft_skills = @softSkills
+        strengths_with_refs = @strengthsWithRefs, weaknesses_with_refs = @weaknessesWithRefs,
+        language_profile = @languageProfile, soft_skills = @softSkills, case_study = @caseStudy
       WHEN NOT MATCHED THEN INSERT
-        (id, session_id, overall_score, category_scores, skill_results, evidence_trace, strengths, weaknesses, language_profile, soft_skills)
+        (id, session_id, overall_score, category_scores, skill_results, evidence_trace, strengths, weaknesses,
+         strengths_with_refs, weaknesses_with_refs, language_profile, soft_skills, case_study)
       VALUES
-        (NEWID(), @sessionId, @overallScore, @categoryScores, @skillResults, @evidenceTrace, @strengths, @weaknesses, @languageProfile, @softSkills);
+        (NEWID(), @sessionId, @overallScore, @categoryScores, @skillResults, @evidenceTrace, @strengths, @weaknesses,
+         @strengthsWithRefs, @weaknessesWithRefs, @languageProfile, @softSkills, @caseStudy);
     `);
 }
 
